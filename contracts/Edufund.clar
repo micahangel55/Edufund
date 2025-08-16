@@ -369,4 +369,329 @@
 (define-read-only (get-application-evaluation (scholarship-id uint) (applicant principal) (evaluator principal))
     (ok (map-get? application-evaluations {scholarship-id: scholarship-id, applicant: applicant, evaluator: evaluator})))
 
+(define-constant ERR-RESOURCE-NOT-FOUND (err u300))
+(define-constant ERR-SUPPLIER-NOT-FOUND (err u301))
+(define-constant ERR-ALREADY-FULFILLED (err u302))
+(define-constant ERR-REQUEST-EXPIRED (err u303))
+(define-constant ERR-INVALID-PRICE (err u304))
+(define-constant ERR-NOT-SUPPLIER (err u305))
+(define-constant ERR-ALREADY-CONFIRMED (err u306))
+(define-constant ERR-NOT-DONOR (err u307))
+(define-constant ERR-RESOURCE-UNAVAILABLE (err u308))
+(define-constant ERR-ALREADY-BORROWED (err u309))
+(define-constant ERR-NOT-OWNER (err u310))
+(define-constant ERR-NOT-BORROWER (err u311))
+(define-constant RESOURCE-REQUEST-DURATION u2880)
+(define-constant MIN-RESOURCE-PRICE u10000)
+
+(define-data-var resource-counter uint u0)
+(define-data-var supplier-counter uint u0)
+
+(define-map resource-suppliers
+    uint
+    {
+        owner: principal,
+        name: (string-ascii 100),
+        category: (string-ascii 50),
+        contact-info: (string-ascii 200),
+        verified: bool,
+        total-sales: uint,
+        reputation-score: uint
+    }
+)
+
+(define-map resource-requests
+    uint
+    {
+        student: principal,
+        title: (string-ascii 100),
+        description: (string-ascii 500),
+        category: (string-ascii 50),
+        target-price: uint,
+        urgency: uint,
+        supplier-id: uint,
+        created-at: uint,
+        expires-at: uint,
+        status: (string-ascii 20),
+        donor: (optional principal),
+        fulfilled-at: (optional uint),
+        delivery-confirmed: bool
+    }
+)
+
+(define-map resource-inventory
+    { supplier-id: uint, resource-title: (string-ascii 100) }
+    {
+        price: uint,
+        stock-quantity: uint,
+        condition: (string-ascii 20),
+        description: (string-ascii 300),
+        availability: bool
+    }
+)
+
+(define-map resource-fulfillments
+    { request-id: uint, donor: principal }
+    {
+        amount-paid: uint,
+        purchase-date: uint,
+        tracking-info: (string-ascii 100),
+        delivery-status: (string-ascii 30)
+    }
+)
+
+(define-map borrowed-resources
+    { resource-id: uint, borrower: principal }
+    {
+        owner: principal,
+        borrowed-at: uint,
+        return-due: uint,
+        deposit-amount: uint,
+        returned: bool
+    }
+)
+
+(define-public (register-supplier 
+    (name (string-ascii 100)) 
+    (category (string-ascii 50)) 
+    (contact-info (string-ascii 200)))
+    (let ((supplier-id (+ (var-get supplier-counter) u1)))
+        (map-set resource-suppliers 
+            supplier-id
+            {
+                owner: tx-sender,
+                name: name,
+                category: category,
+                contact-info: contact-info,
+                verified: false,
+                total-sales: u0,
+                reputation-score: u100
+            }
+        )
+        (var-set supplier-counter supplier-id)
+        (ok supplier-id)))
+
+(define-public (add-resource-to-inventory 
+    (supplier-id uint) 
+    (resource-title (string-ascii 100)) 
+    (price uint) 
+    (stock-quantity uint) 
+    (condition (string-ascii 20)) 
+    (description (string-ascii 300)))
+    (let ((supplier (unwrap! (map-get? resource-suppliers supplier-id) ERR-SUPPLIER-NOT-FOUND)))
+        (asserts! (is-eq (get owner supplier) tx-sender) ERR-NOT-SUPPLIER)
+        (asserts! (>= price MIN-RESOURCE-PRICE) ERR-INVALID-PRICE)
+        (asserts! (> stock-quantity u0) ERR-INVALID-AMOUNT)
+        (map-set resource-inventory 
+            {supplier-id: supplier-id, resource-title: resource-title}
+            {
+                price: price,
+                stock-quantity: stock-quantity,
+                condition: condition,
+                description: description,
+                availability: true
+            }
+        )
+        (ok true)))
+
+(define-public (create-resource-request 
+    (title (string-ascii 100)) 
+    (description (string-ascii 500)) 
+    (category (string-ascii 50)) 
+    (target-price uint) 
+    (urgency uint) 
+    (supplier-id uint))
+    (let (
+        (request-id (+ (var-get resource-counter) u1))
+        (current-height stacks-block-height)
+        (expires-at (+ current-height RESOURCE-REQUEST-DURATION))
+        )
+        (asserts! (>= target-price MIN-RESOURCE-PRICE) ERR-INVALID-PRICE)
+        (asserts! (<= urgency u5) ERR-INVALID-AMOUNT)
+        (asserts! (is-some (map-get? resource-suppliers supplier-id)) ERR-SUPPLIER-NOT-FOUND)
+        (map-set resource-requests 
+            request-id
+            {
+                student: tx-sender,
+                title: title,
+                description: description,
+                category: category,
+                target-price: target-price,
+                urgency: urgency,
+                supplier-id: supplier-id,
+                created-at: current-height,
+                expires-at: expires-at,
+                status: "open",
+                donor: none,
+                fulfilled-at: none,
+                delivery-confirmed: false
+            }
+        )
+        (var-set resource-counter request-id)
+        (ok request-id)))
+
+(define-public (fulfill-resource-request (request-id uint) (tracking-info (string-ascii 100)))
+    (let (
+        (request (unwrap! (map-get? resource-requests request-id) ERR-RESOURCE-NOT-FOUND))
+        (supplier-id (get supplier-id request))
+        (resource-title (get title request))
+        (target-price (get target-price request))
+        (current-height stacks-block-height)
+        (inventory-item (map-get? resource-inventory {supplier-id: supplier-id, resource-title: resource-title}))
+        )
+        (asserts! (< current-height (get expires-at request)) ERR-REQUEST-EXPIRED)
+        (asserts! (is-eq (get status request) "open") ERR-ALREADY-FULFILLED)
+        (match inventory-item
+            some-item (asserts! (and (get availability some-item) (> (get stock-quantity some-item) u0)) ERR-RESOURCE-UNAVAILABLE)
+            (asserts! false ERR-RESOURCE-NOT-FOUND)
+        )
+        (try! (stx-transfer? target-price tx-sender (as-contract tx-sender)))
+        (map-set resource-requests 
+            request-id
+            (merge request {
+                status: "fulfilled",
+                donor: (some tx-sender),
+                fulfilled-at: (some current-height)
+            })
+        )
+        (map-set resource-fulfillments 
+            {request-id: request-id, donor: tx-sender}
+            {
+                amount-paid: target-price,
+                purchase-date: current-height,
+                tracking-info: tracking-info,
+                delivery-status: "shipped"
+            }
+        )
+        (match inventory-item
+            some-item (map-set resource-inventory 
+                {supplier-id: supplier-id, resource-title: resource-title}
+                (merge some-item {stock-quantity: (- (get stock-quantity some-item) u1)})
+            )
+            false
+        )
+        (ok true)))
+
+(define-public (confirm-resource-delivery (request-id uint))
+    (let (
+        (request (unwrap! (map-get? resource-requests request-id) ERR-RESOURCE-NOT-FOUND))
+        (supplier-id (get supplier-id request))
+        (supplier (unwrap! (map-get? resource-suppliers supplier-id) ERR-SUPPLIER-NOT-FOUND))
+        )
+        (asserts! (is-eq (get student request) tx-sender) ERR-NOT-AUTHORIZED)
+        (asserts! (is-eq (get status request) "fulfilled") ERR-NOT-AUTHORIZED)
+        (asserts! (not (get delivery-confirmed request)) ERR-ALREADY-CONFIRMED)
+        (match (get donor request)
+            some-donor (match (get fulfilled-at request)
+                some-fulfillment-date (begin
+                    (try! (as-contract (stx-transfer? (get target-price request) tx-sender (get owner supplier))))
+                    (map-set resource-requests 
+                        request-id
+                        (merge request {
+                            status: "completed",
+                            delivery-confirmed: true
+                        })
+                    )
+                    (map-set resource-fulfillments 
+                        {request-id: request-id, donor: some-donor}
+                        (merge (unwrap-panic (map-get? resource-fulfillments {request-id: request-id, donor: some-donor})) 
+                            {delivery-status: "delivered"})
+                    )
+                    (map-set resource-suppliers 
+                        supplier-id
+                        (merge supplier {
+                            total-sales: (+ (get total-sales supplier) u1),
+                            reputation-score: (if (> (+ (get reputation-score supplier) u5) u1000) u1000 (+ (get reputation-score supplier) u5))
+                        })
+                    )
+                    (ok true)
+                )
+                ERR-NOT-AUTHORIZED
+            )
+            ERR-NOT-DONOR
+        )))
+
+(define-public (list-resource-for-sharing 
+    (resource-title (string-ascii 100)) 
+    (description (string-ascii 300)) 
+    (deposit-amount uint) 
+    (max-borrow-duration uint))
+    (let ((resource-id (+ (var-get resource-counter) u1)))
+        (asserts! (>= deposit-amount u10000) ERR-INVALID-AMOUNT)
+        (asserts! (>= max-borrow-duration u144) ERR-INVALID-AMOUNT)
+        (map-set resource-inventory 
+            {supplier-id: u0, resource-title: resource-title}
+            {
+                price: deposit-amount,
+                stock-quantity: u1,
+                condition: "shared",
+                description: description,
+                availability: true
+            }
+        )
+        (var-set resource-counter resource-id)
+        (ok resource-id)))
+
+(define-public (borrow-resource (resource-id uint) (borrow-duration uint))
+    (let (
+        (resource-key {supplier-id: u0, resource-title: (unwrap-panic (element-at? (list "shared-resource") u0))})
+        (resource-item (unwrap! (map-get? resource-inventory resource-key) ERR-RESOURCE-NOT-FOUND))
+        (deposit-amount (get price resource-item))
+        (current-height stacks-block-height)
+        (return-due (+ current-height borrow-duration))
+        )
+        (asserts! (get availability resource-item) ERR-RESOURCE-UNAVAILABLE)
+        (asserts! (is-none (map-get? borrowed-resources {resource-id: resource-id, borrower: tx-sender})) ERR-ALREADY-BORROWED)
+        (asserts! (>= borrow-duration u144) ERR-INVALID-AMOUNT)
+        (try! (stx-transfer? deposit-amount tx-sender (as-contract tx-sender)))
+        (map-set borrowed-resources 
+            {resource-id: resource-id, borrower: tx-sender}
+            {
+                owner: tx-sender,
+                borrowed-at: current-height,
+                return-due: return-due,
+                deposit-amount: deposit-amount,
+                returned: false
+            }
+        )
+        (map-set resource-inventory 
+            resource-key
+            (merge resource-item {availability: false})
+        )
+        (ok true)))
+
+(define-public (return-borrowed-resource (resource-id uint))
+    (let (
+        (borrow-record (unwrap! (map-get? borrowed-resources {resource-id: resource-id, borrower: tx-sender}) ERR-NOT-BORROWER))
+        (resource-key {supplier-id: u0, resource-title: (unwrap-panic (element-at? (list "shared-resource") u0))})
+        (resource-item (unwrap! (map-get? resource-inventory resource-key) ERR-RESOURCE-NOT-FOUND))
+        (deposit-amount (get deposit-amount borrow-record))
+        )
+        (asserts! (not (get returned borrow-record)) ERR-ALREADY-CONFIRMED)
+        (try! (as-contract (stx-transfer? deposit-amount tx-sender tx-sender)))
+        (map-set borrowed-resources 
+            {resource-id: resource-id, borrower: tx-sender}
+            (merge borrow-record {returned: true})
+        )
+        (map-set resource-inventory 
+            resource-key
+            (merge resource-item {availability: true})
+        )
+        (ok deposit-amount)))
+
+(define-read-only (get-resource-request (request-id uint))
+    (ok (map-get? resource-requests request-id)))
+
+(define-read-only (get-supplier (supplier-id uint))
+    (ok (map-get? resource-suppliers supplier-id)))
+
+(define-read-only (get-inventory-item (supplier-id uint) (resource-title (string-ascii 100)))
+    (ok (map-get? resource-inventory {supplier-id: supplier-id, resource-title: resource-title})))
+
+(define-read-only (get-fulfillment (request-id uint) (donor principal))
+    (ok (map-get? resource-fulfillments {request-id: request-id, donor: donor})))
+
+(define-read-only (get-borrow-record (resource-id uint) (borrower principal))
+    (ok (map-get? borrowed-resources {resource-id: resource-id, borrower: borrower})))
+
 
